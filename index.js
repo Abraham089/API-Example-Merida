@@ -208,6 +208,126 @@ app.delete(`${PRODUCT_BASE_URL}/:id`, async (req, res) => {
   }
 });
 
+const PURCHASE_BASE_URL = "/api/purchases";
+const MAX_PRODUCTS = 5;
+const MAX_TOTAL = 3500.0;
+
+app.post(PURCHASE_BASE_URL, async (req, res) => {
+  const { user_id, status, details } = req.body;
+  let connection;
+
+  if (!user_id || !status || !details || details.length === 0) {
+    return res.status(400).json({
+      error:
+        "Todos los campos (user_id, status, details) son obligatorios y debe haber al menos un producto.",
+    });
+  }
+  if (details.length > MAX_PRODUCTS) {
+    return res.status(400).json({
+      error: `No se pueden guardar más de ${MAX_PRODUCTS} productos por compra.`,
+    });
+  }
+
+  try {
+    connection = await pool.getConnection();
+    await connection.beginTransaction();
+
+    let totalCompra = 0;
+    const purchaseDetails = [];
+
+    for (const item of details) {
+      const { product_id, quantity, price } = item;
+
+      if (!product_id || !quantity || !price || quantity <= 0 || price <= 0) {
+        await connection.rollback();
+        return res.status(400).json({
+          error:
+            "Cada detalle de producto debe tener id, cantidad (>0) y precio (>0).",
+        });
+      }
+
+      const [productRows] = await connection.query(
+        "SELECT stock, price FROM products WHERE id = ?",
+        [product_id]
+      );
+
+      if (productRows.length === 0) {
+        await connection.rollback();
+        return res
+          .status(404)
+          .json({ error: `Producto con ID ${product_id} no encontrado.` });
+      }
+
+      const currentStock = productRows[0].stock;
+      if (currentStock < quantity) {
+        await connection.rollback();
+        return res.status(400).json({
+          error: `Stock insuficiente para el producto ID ${product_id}. Disponible: ${currentStock}`,
+        });
+      }
+
+      const subtotal = quantity * price;
+      totalCompra += subtotal;
+      purchaseDetails.push({ ...item, subtotal });
+    }
+
+    if (totalCompra > MAX_TOTAL) {
+      await connection.rollback();
+      return res.status(400).json({
+        error: `El total de la compra (${totalCompra.toFixed(
+          2
+        )}) no puede pasar de $${MAX_TOTAL}.`,
+      });
+    }
+
+    const purchaseQuery =
+      "INSERT INTO purchases (user_id, total, status, purchase_date) VALUES (?, ?, ?, NOW())";
+    const [purchaseResult] = await connection.query(purchaseQuery, [
+      user_id,
+      totalCompra,
+      status,
+    ]);
+    const purchase_id = purchaseResult.insertId;
+
+    for (const item of purchaseDetails) {
+      const { product_id, quantity, price, subtotal } = item;
+
+      const detailQuery =
+        "INSERT INTO purchase_details (purchase_id, product_id, quantity, price, subtotal) VALUES (?, ?, ?, ?, ?)";
+      await connection.query(detailQuery, [
+        purchase_id,
+        product_id,
+        quantity,
+        price,
+        subtotal,
+      ]);
+
+      const stockUpdateQuery =
+        "UPDATE products SET stock = stock - ? WHERE id = ?";
+      await connection.query(stockUpdateQuery, [quantity, product_id]);
+    }
+
+    await connection.commit();
+    res.status(201).json({
+      message: "Compra y detalles creados exitosamente. Stock descontado.",
+      purchase_id: purchase_id,
+      total: totalCompra.toFixed(2),
+    });
+  } catch (err) {
+    console.error("Error durante la creación de la compra:", err);
+    if (connection) {
+      await connection.rollback();
+    }
+    res
+      .status(500)
+      .json({ error: "Error interno del servidor al procesar la compra." });
+  } finally {
+    if (connection) {
+      connection.release();
+    }
+  }
+});
+
 app.listen(port, () => {
   console.log(`App listening at http://localhost:${port}`);
 });
