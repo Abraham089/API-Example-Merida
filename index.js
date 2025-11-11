@@ -352,11 +352,9 @@ app.put(`${PURCHASE_BASE_URL}/:id`, async (req, res) => {
     const currentStatus = currentPurchaseRows[0].status;
     if (currentStatus === "COMPLETED") {
       await connection.rollback();
-      return res
-        .status(400)
-        .json({
-          error: 'No se puede modificar una compra con estatus "COMPLETED".',
-        });
+      return res.status(400).json({
+        error: 'No se puede modificar una compra con estatus "COMPLETED".',
+      });
     }
 
     const updateFields = [];
@@ -381,11 +379,9 @@ app.put(`${PURCHASE_BASE_URL}/:id`, async (req, res) => {
     if (details && details.length > 0) {
       if (details.length > MAX_PRODUCTS) {
         await connection.rollback();
-        return res
-          .status(400)
-          .json({
-            error: `No se pueden guardar más de ${MAX_PRODUCTS} productos por compra.`,
-          });
+        return res.status(400).json({
+          error: `No se pueden guardar más de ${MAX_PRODUCTS} productos por compra.`,
+        });
       }
 
       const [oldDetails] = await connection.query(
@@ -412,12 +408,10 @@ app.put(`${PURCHASE_BASE_URL}/:id`, async (req, res) => {
 
         if (!product_id || !quantity || !price || quantity <= 0 || price <= 0) {
           await connection.rollback();
-          return res
-            .status(400)
-            .json({
-              error:
-                "Cada detalle de producto debe tener id, cantidad (>0) y precio (>0).",
-            });
+          return res.status(400).json({
+            error:
+              "Cada detalle de producto debe tener id, cantidad (>0) y precio (>0).",
+          });
         }
 
         const [productRows] = await connection.query(
@@ -428,11 +422,9 @@ app.put(`${PURCHASE_BASE_URL}/:id`, async (req, res) => {
 
         if (currentStock < quantity) {
           await connection.rollback();
-          return res
-            .status(400)
-            .json({
-              error: `Stock insuficiente para el producto ID ${product_id}. Disponible: ${currentStock}`,
-            });
+          return res.status(400).json({
+            error: `Stock insuficiente para el producto ID ${product_id}. Disponible: ${currentStock}`,
+          });
         }
 
         const subtotal = quantity * price;
@@ -442,13 +434,11 @@ app.put(`${PURCHASE_BASE_URL}/:id`, async (req, res) => {
 
       if (newTotalCompra > MAX_TOTAL) {
         await connection.rollback();
-        return res
-          .status(400)
-          .json({
-            error: `El total de la compra (${newTotalCompra.toFixed(
-              2
-            )}) no puede pasar de $${MAX_TOTAL}.`,
-          });
+        return res.status(400).json({
+          error: `El total de la compra (${newTotalCompra.toFixed(
+            2
+          )}) no puede pasar de $${MAX_TOTAL}.`,
+        });
       }
 
       for (const item of newPurchaseDetails) {
@@ -485,12 +475,10 @@ app.put(`${PURCHASE_BASE_URL}/:id`, async (req, res) => {
     if (connection) {
       await connection.rollback();
     }
-    res
-      .status(500)
-      .json({
-        error:
-          "Error interno del servidor al procesar la actualización de la compra.",
-      });
+    res.status(500).json({
+      error:
+        "Error interno del servidor al procesar la actualización de la compra.",
+    });
   } finally {
     if (connection) {
       connection.release();
@@ -520,11 +508,9 @@ app.delete(`${PURCHASE_BASE_URL}/:id`, async (req, res) => {
 
     if (purchaseRows[0].status === "COMPLETED") {
       await connection.rollback();
-      return res
-        .status(400)
-        .json({
-          error: 'No se pueden borrar compras con estatus "COMPLETED".',
-        });
+      return res.status(400).json({
+        error: 'No se pueden borrar compras con estatus "COMPLETED".',
+      });
     }
 
     const [detailsRows] = await connection.query(
@@ -567,6 +553,117 @@ app.delete(`${PURCHASE_BASE_URL}/:id`, async (req, res) => {
     if (connection) {
       connection.release();
     }
+  }
+});
+
+app.get(`${PURCHASE_BASE_URL}/:id`, async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    const query = `
+            SELECT 
+                p.id AS purchase_id, p.total, p.status, p.purchase_date,
+                u.name AS user_name,
+                pd.id AS detail_id, pd.quantity, pd.price AS detail_price, pd.subtotal,
+                pr.name AS product_name
+            FROM purchases p
+            JOIN users u ON p.user_id = u.id
+            LEFT JOIN purchase_details pd ON p.id = pd.purchase_id
+            LEFT JOIN products pr ON pd.product_id = pr.id
+            WHERE p.id = ?
+            ORDER BY pd.id;
+        `;
+
+    const [rows] = await pool.query(query, [id]);
+
+    if (rows.length === 0 || rows[0].purchase_id === null) {
+      return res
+        .status(404)
+        .json({ error: `Compra con ID ${id} no encontrada.` });
+    }
+
+    const purchase = {
+      id: rows[0].purchase_id,
+      user: rows[0].user_name,
+      total: rows[0].total,
+      status: rows[0].status,
+      purchase_date: rows[0].purchase_date,
+      details: [],
+    };
+
+    if (rows[0].detail_id !== null) {
+      rows.forEach((row) => {
+        purchase.details.push({
+          id: row.detail_id,
+          product: row.product_name,
+          quantity: row.quantity,
+          price: row.detail_price,
+          subtotal: row.subtotal,
+        });
+      });
+    }
+
+    res.json(purchase);
+  } catch (err) {
+    console.error(`Error retrieving purchase with ID ${id}:`, err);
+    res
+      .status(500)
+      .json({ error: "Error interno del servidor al recuperar la compra." });
+  }
+});
+
+app.get(PURCHASE_BASE_URL, async (req, res) => {
+  try {
+    const query = `
+            SELECT 
+                p.id AS purchase_id, p.total, p.status, p.purchase_date,
+                u.name AS user_name,
+                pd.id AS detail_id, pd.quantity, pd.price AS detail_price, pd.subtotal,
+                pr.name AS product_name
+            FROM purchases p
+            JOIN users u ON p.user_id = u.id
+            LEFT JOIN purchase_details pd ON p.id = pd.purchase_id
+            LEFT JOIN products pr ON pd.product_id = pr.id
+            ORDER BY p.id, pd.id;
+        `;
+
+    const [rows] = await pool.query(query);
+
+    if (rows.length === 0) {
+      return res.json([]);
+    }
+
+    const purchasesMap = new Map();
+
+    rows.forEach((row) => {
+      if (!purchasesMap.has(row.purchase_id)) {
+        purchasesMap.set(row.purchase_id, {
+          id: row.purchase_id,
+          user: row.user_name,
+          total: row.total,
+          status: row.status,
+          purchase_date: row.purchase_date,
+          details: [],
+        });
+      }
+
+      if (row.detail_id !== null) {
+        purchasesMap.get(row.purchase_id).details.push({
+          id: row.detail_id,
+          product: row.product_name,
+          quantity: row.quantity,
+          price: row.detail_price,
+          subtotal: row.subtotal,
+        });
+      }
+    });
+
+    res.json(Array.from(purchasesMap.values()));
+  } catch (err) {
+    console.error("Error retrieving all purchases:", err);
+    res
+      .status(500)
+      .json({ error: "Error interno del servidor al recuperar las compras." });
   }
 });
 
