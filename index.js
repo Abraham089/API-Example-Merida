@@ -328,6 +328,248 @@ app.post(PURCHASE_BASE_URL, async (req, res) => {
   }
 });
 
+app.put(`${PURCHASE_BASE_URL}/:id`, async (req, res) => {
+  const { id } = req.params;
+  const { user_id, status, details } = req.body;
+  let connection;
+
+  try {
+    connection = await pool.getConnection();
+    await connection.beginTransaction();
+
+    const [currentPurchaseRows] = await connection.query(
+      "SELECT user_id, status FROM purchases WHERE id = ? FOR UPDATE",
+      [id]
+    );
+
+    if (currentPurchaseRows.length === 0) {
+      await connection.rollback();
+      return res
+        .status(404)
+        .json({ error: `Compra con ID ${id} no encontrada.` });
+    }
+
+    const currentStatus = currentPurchaseRows[0].status;
+    if (currentStatus === "COMPLETED") {
+      await connection.rollback();
+      return res
+        .status(400)
+        .json({
+          error: 'No se puede modificar una compra con estatus "COMPLETED".',
+        });
+    }
+
+    const updateFields = [];
+    const updateValues = [];
+
+    if (user_id !== undefined) {
+      updateFields.push("user_id = ?");
+      updateValues.push(user_id);
+    }
+    if (status !== undefined) {
+      updateFields.push("status = ?");
+      updateValues.push(status);
+    }
+
+    if (updateFields.length > 0) {
+      const purchaseUpdateQuery = `UPDATE purchases SET ${updateFields.join(
+        ", "
+      )} WHERE id = ?`;
+      await connection.query(purchaseUpdateQuery, [...updateValues, id]);
+    }
+
+    if (details && details.length > 0) {
+      if (details.length > MAX_PRODUCTS) {
+        await connection.rollback();
+        return res
+          .status(400)
+          .json({
+            error: `No se pueden guardar más de ${MAX_PRODUCTS} productos por compra.`,
+          });
+      }
+
+      const [oldDetails] = await connection.query(
+        "SELECT product_id, quantity FROM purchase_details WHERE purchase_id = ?",
+        [id]
+      );
+      for (const oldItem of oldDetails) {
+        await connection.query(
+          "UPDATE products SET stock = stock + ? WHERE id = ?",
+          [oldItem.quantity, oldItem.product_id]
+        );
+      }
+
+      await connection.query(
+        "DELETE FROM purchase_details WHERE purchase_id = ?",
+        [id]
+      );
+
+      let newTotalCompra = 0;
+      const newPurchaseDetails = [];
+
+      for (const newItem of details) {
+        const { product_id, quantity, price } = newItem;
+
+        if (!product_id || !quantity || !price || quantity <= 0 || price <= 0) {
+          await connection.rollback();
+          return res
+            .status(400)
+            .json({
+              error:
+                "Cada detalle de producto debe tener id, cantidad (>0) y precio (>0).",
+            });
+        }
+
+        const [productRows] = await connection.query(
+          "SELECT stock FROM products WHERE id = ?",
+          [product_id]
+        );
+        const currentStock = productRows[0].stock;
+
+        if (currentStock < quantity) {
+          await connection.rollback();
+          return res
+            .status(400)
+            .json({
+              error: `Stock insuficiente para el producto ID ${product_id}. Disponible: ${currentStock}`,
+            });
+        }
+
+        const subtotal = quantity * price;
+        newTotalCompra += subtotal;
+        newPurchaseDetails.push({ ...newItem, subtotal });
+      }
+
+      if (newTotalCompra > MAX_TOTAL) {
+        await connection.rollback();
+        return res
+          .status(400)
+          .json({
+            error: `El total de la compra (${newTotalCompra.toFixed(
+              2
+            )}) no puede pasar de $${MAX_TOTAL}.`,
+          });
+      }
+
+      for (const item of newPurchaseDetails) {
+        const { product_id, quantity, price, subtotal } = item;
+        const detailQuery =
+          "INSERT INTO purchase_details (purchase_id, product_id, quantity, price, subtotal) VALUES (?, ?, ?, ?, ?)";
+        await connection.query(detailQuery, [
+          id,
+          product_id,
+          quantity,
+          price,
+          subtotal,
+        ]);
+
+        await connection.query(
+          "UPDATE products SET stock = stock - ? WHERE id = ?",
+          [quantity, product_id]
+        );
+      }
+
+      await connection.query("UPDATE purchases SET total = ? WHERE id = ?", [
+        newTotalCompra,
+        id,
+      ]);
+    }
+
+    await connection.commit();
+    res.json({
+      message: `Compra con ID ${id} actualizada exitosamente.`,
+      status: status || currentStatus,
+    });
+  } catch (err) {
+    console.error("Error durante la actualización de la compra:", err);
+    if (connection) {
+      await connection.rollback();
+    }
+    res
+      .status(500)
+      .json({
+        error:
+          "Error interno del servidor al procesar la actualización de la compra.",
+      });
+  } finally {
+    if (connection) {
+      connection.release();
+    }
+  }
+});
+
+app.delete(`${PURCHASE_BASE_URL}/:id`, async (req, res) => {
+  const { id } = req.params;
+  let connection;
+
+  try {
+    connection = await pool.getConnection();
+    await connection.beginTransaction();
+
+    const [purchaseRows] = await connection.query(
+      "SELECT status FROM purchases WHERE id = ? FOR UPDATE",
+      [id]
+    );
+
+    if (purchaseRows.length === 0) {
+      await connection.rollback();
+      return res
+        .status(404)
+        .json({ error: `Compra con ID ${id} no encontrada.` });
+    }
+
+    if (purchaseRows[0].status === "COMPLETED") {
+      await connection.rollback();
+      return res
+        .status(400)
+        .json({
+          error: 'No se pueden borrar compras con estatus "COMPLETED".',
+        });
+    }
+
+    const [detailsRows] = await connection.query(
+      "SELECT product_id, quantity FROM purchase_details WHERE purchase_id = ?",
+      [id]
+    );
+
+    for (const item of detailsRows) {
+      await connection.query(
+        "UPDATE products SET stock = stock + ? WHERE id = ?",
+        [item.quantity, item.product_id]
+      );
+    }
+
+    await connection.query(
+      "DELETE FROM purchase_details WHERE purchase_id = ?",
+      [id]
+    );
+
+    const [deleteResult] = await connection.query(
+      "DELETE FROM purchases WHERE id = ?",
+      [id]
+    );
+
+    await connection.commit();
+
+    res.json({
+      message: `Compra con ID ${id} eliminada exitosamente. Stock devuelto.`,
+      deleted: deleteResult.affectedRows,
+    });
+  } catch (err) {
+    console.error("Error durante la eliminación de la compra:", err);
+    if (connection) {
+      await connection.rollback();
+    }
+    res
+      .status(500)
+      .json({ error: "Error interno del servidor al eliminar la compra." });
+  } finally {
+    if (connection) {
+      connection.release();
+    }
+  }
+});
+
 app.listen(port, () => {
   console.log(`App listening at http://localhost:${port}`);
 });
